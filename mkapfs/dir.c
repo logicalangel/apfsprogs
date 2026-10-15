@@ -157,6 +157,7 @@ static int make_special_inode_val(u64 ino, char *name,
 	val->owner = cpu_to_le32(geteuid());
 	val->group = cpu_to_le32(getegid());
 	val->mode = cpu_to_le16(0755 | S_IFDIR);
+	val->internal_flags = cpu_to_le64(APFS_INODE_NO_RSRC_FORK);
 
 	xblob = (struct apfs_xf_blob *)val->xfields;
 	xblob->xf_num_exts = cpu_to_le16(1); /* Just the primary name */
