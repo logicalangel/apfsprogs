@@ -775,7 +775,7 @@ static void check_inode_internal_flags(u64 flags, u64 ino)
 	if ((flags & APFS_INODE_DIR_STATS_ORIGIN) &&
 	    !(flags & APFS_INODE_MAINTAIN_DIR_STATS))
 		report("Inode record", "incompatible directory stats flags.");
-	if (flags & APFS_INODE_HAS_RSRC_FORK && flags & APFS_INODE_NO_RSRC_FORK)
+	if ((bool)(flags & APFS_INODE_HAS_RSRC_FORK) == (bool)(flags & APFS_INODE_NO_RSRC_FORK))
 		report("Inode record", "incompatible resource fork flags.");
 
 	if (flags & APFS_INODE_BEING_TRUNCATED)
