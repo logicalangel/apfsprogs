@@ -544,7 +544,13 @@ static void check_new_alloc_zone(u16 id, u64 start, u64 end)
 	struct alloc_zone *zone = NULL;
 	struct alloc_zone *new = NULL;
 
-	check_alloc_zone_sanity(start, end);
+	/*
+	 * Containers of 8 GiB and up get four zones when they are created, but
+	 * each one only gets its boundaries once it's first used. Until then
+	 * they are both zero, so the zone can't overlap with anything.
+	 */
+	if (start || end != APFS_SM_ALLOCZONE_INVALID_END_BOUNDARY)
+		check_alloc_zone_sanity(start, end);
 
 	zone_p = &alloc_zone_list;
 	zone = *zone_p;
