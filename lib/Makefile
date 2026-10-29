@@ -1,5 +1,6 @@
 SRCS = aes.c checksum.c libzbitmap.c parameters.c sha256.c unicode.c
 SRCS += $(wildcard zlib_inflate/*.c)
+SRCS += $(wildcard lzfse/*.c)
 OBJS = $(SRCS:.c=.o)
 DEPS = $(SRCS:.c=.d)
 

@@ -8,6 +8,8 @@
 #include <sys/mman.h>
 #include "apfs/raw.h"
 #include "apfs/libzbitmap.h"
+#include "apfs/lzfse/lzfse.h"
+#include "apfs/lzfse/lzvn_decode_base.h"
 #include "apfs/zlib_inflate/zlib.h"
 #include "apfsck.h"
 #include "btree.h"
@@ -60,6 +62,65 @@ static inline bool apfs_compressed_in_dstream(struct compress *compress)
     return compress->rsrc_dstream && !compress->rsrc_dstream->d_inline;
 }
 
+/*
+ * Resource forks for these algorithms are just a table of little-endian block
+ * offsets followed by the blocks; zlib uses a classic resource fork layout.
+ */
+static inline bool apfs_compress_has_offset_table(u32 algo)
+{
+    return algo == APFS_COMPRESS_LZVN_RSRC || algo == APFS_COMPRESS_LZFSE_RSRC ||
+           algo == APFS_COMPRESS_LZBITMAP_RSRC;
+}
+
+/* Returns the decompressed length, or -1 if @src is not a valid lzvn stream */
+static ssize_t lzvn_decode_blob(void *dst, size_t dst_size, u8 *src, size_t src_size)
+{
+    lzvn_decoder_state dstate = {0};
+
+    if(src_size < 1)
+        return -1;
+    /* Stored uncompressed */
+    if(src[0] == 0x06) {
+        if(src_size - 1 > dst_size)
+            return -1;
+        memcpy(dst, src + 1, src_size - 1);
+        return src_size - 1;
+    }
+
+    dstate.src = src;
+    dstate.src_end = src + src_size;
+    dstate.dst = dstate.dst_begin = dst;
+    dstate.dst_end = dstate.dst + dst_size;
+    lzvn_decode(&dstate);
+    if(!dstate.end_of_stream)
+        return -1;
+    return dstate.dst - dstate.dst_begin;
+}
+
+/* Returns the decompressed length, or -1 if @src is not a valid lzfse stream */
+static ssize_t lzfse_decode_blob(void *dst, size_t dst_size, u8 *src, size_t src_size)
+{
+    size_t res;
+
+    if(src_size < 1)
+        return -1;
+    /* Stored uncompressed */
+    if((src[0] & 0x0F) == 0x0F) {
+        if(src_size - 1 > dst_size)
+            return -1;
+        memcpy(dst, src + 1, src_size - 1);
+        return src_size - 1;
+    }
+
+    /* Compressed blocks start with an lzfse block magic, "bvx?" */
+    if(src[0] != 'b' || src_size < 2)
+        return -1;
+    res = lzfse_decode_buffer(dst, dst_size, src, src_size, NULL);
+    if(res == 0)
+        return -1;
+    return res;
+}
+
 void apfs_compress_open(struct compress *compress)
 {
     struct dstream *rsrc = compress->rsrc_dstream;
@@ -76,7 +137,7 @@ void apfs_compress_open(struct compress *compress)
         report("Compressed file", "missing decmpfs xattr.");
     memcpy(&fd->hdr, compress->decmpfs, sizeof(fd->hdr));
 
-    if(apfs_compressed_in_dstream(compress) && le32_to_cpu(fd->hdr.algo) != APFS_COMPRESS_LZBITMAP_RSRC) {
+    if(apfs_compressed_in_dstream(compress) && !apfs_compress_has_offset_table(le32_to_cpu(fd->hdr.algo))) {
         struct apfs_compress_rsrc_hdr *rsrc_hdr = NULL;
         struct apfs_compress_rsrc_data *rsrc_data = NULL;
     	u32 data_end;
@@ -140,13 +201,13 @@ void apfs_compress_open(struct compress *compress)
         /* Put a rough bound on block count to avoid overflow */
         for(i = 0; i < MAX_FBUF_SIZE; ++i) {
             if((i + 1) * sizeof(*block_offs) >= fd->size)
-                report("LZBITMAP-compressed file", "block offsets won't fit.");
+                report("Resource compressed file", "block offsets won't fit.");
             if(le32_to_cpu(block_offs[i]) == fd->size)
                 break;
         }
         compress->block_num = i;
         if(compress->block_num == MAX_FBUF_SIZE)
-            report("LZBITMAP-compressed file", "missing final block offset.");
+            report("Resource compressed file", "missing final block offset.");
     } else {
         if(le64_to_cpu(fd->hdr.size) > MAX_FBUF_SIZE)
             report("Inline compressed file", "size is too big.");
@@ -175,6 +236,14 @@ void apfs_compress_open(struct compress *compress)
                 report("Inline compressed file", "invalid header for zlib.");
             }
             break;
+        case APFS_COMPRESS_LZVN_ATTR:
+            if(lzvn_decode_blob(fd->data, fd->size, cdata, csize) != fd->size)
+                report("Inline compressed file", "invalid lzvn compression.");
+            break;
+        case APFS_COMPRESS_LZFSE_ATTR:
+            if(lzfse_decode_blob(fd->data, fd->size, cdata, csize) != fd->size)
+                report("Inline compressed file", "invalid lzfse compression.");
+            break;
         case APFS_COMPRESS_PLAIN_ATTR:
             if(csize - 1 != fd->size)
                 report("Inline uncompressed file", "wron reported length.");
@@ -194,7 +263,7 @@ static ssize_t apfs_compress_read_block(struct compress *compress, char *buf, si
     u32 doffs, coffs;
     loff_t block;
     u8 *cdata, *tmp = fd->buf;
-    size_t csize, bsize;
+    size_t csize, bsize, max_csize;
     ssize_t res;
 
     if(off >= (loff_t)le64_to_cpu(fd->hdr.size))
@@ -210,7 +279,7 @@ static ssize_t apfs_compress_read_block(struct compress *compress, char *buf, si
         if(block >= compress->block_num)
             return 0;
 
-        if(le32_to_cpu(fd->hdr.algo) != APFS_COMPRESS_LZBITMAP_RSRC) {
+        if(!apfs_compress_has_offset_table(le32_to_cpu(fd->hdr.algo))) {
             struct apfs_compress_rsrc_data *cd = fd->data + doffs;
 
             bsize = le64_to_cpu(fd->hdr.size) - block * APFS_COMPRESS_BLOCK;
@@ -229,7 +298,20 @@ static ssize_t apfs_compress_read_block(struct compress *compress, char *buf, si
             coffs = le32_to_cpu(block_offs[block]);
             csize = le32_to_cpu(block_offs[block + 1]) - coffs;
         }
-        if(coffs >= fd->size - doffs || fd->size - doffs - coffs < (loff_t)csize || csize > APFS_COMPRESS_BLOCK + 1)
+        /*
+         * Incompressible lzvn and lzfse blocks may be stored compressed anyway,
+         * a little bigger than the raw data (afsctool does this). The decoders
+         * can't write past the block, so only the position needs checking.
+         */
+        switch(le32_to_cpu(fd->hdr.algo)) {
+        case APFS_COMPRESS_LZVN_RSRC:
+        case APFS_COMPRESS_LZFSE_RSRC:
+            max_csize = fd->size;
+            break;
+        default:
+            max_csize = APFS_COMPRESS_BLOCK + 1;
+        }
+        if(coffs >= fd->size - doffs || fd->size - doffs - coffs < (loff_t)csize || csize > max_csize)
             report("Resource compressed file", "invalid block size or position.");
         cdata = fd->data + doffs + coffs;
 
@@ -246,6 +328,18 @@ static ssize_t apfs_compress_read_block(struct compress *compress, char *buf, si
             } else {
                 report("Resource compressed file", "invalid header for zlib.");
             }
+            break;
+        case APFS_COMPRESS_LZVN_RSRC:
+            res = lzvn_decode_blob(tmp, bsize, cdata, csize);
+            if(res < 0)
+                report("LZVN compressed file", "invalid compression.");
+            bsize = res;
+            break;
+        case APFS_COMPRESS_LZFSE_RSRC:
+            res = lzfse_decode_blob(tmp, bsize, cdata, csize);
+            if(res < 0)
+                report("LZFSE compressed file", "invalid compression.");
+            bsize = res;
             break;
         case APFS_COMPRESS_LZBITMAP_RSRC:
             if(cdata[0] == 0x5a) {
