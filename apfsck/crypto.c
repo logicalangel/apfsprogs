@@ -9,10 +9,60 @@
 #include "spaceman.h"
 #include "super.h"
 
-static void check_volume_key_entry(const u8 *keydata, u16 keylen)
+/**
+ * der_read - Read one element of a DER blob
+ * @p:		pointer to the element, moved past it on return
+ * @end:	end of the enclosing element
+ * @tag:	expected tag
+ * @len:	expected length of the contents, or -1 for any
+ *
+ * Returns a pointer to the contents. Keybag entries are too small to need the
+ * long form for lengths, so that gets reported too.
+ */
+static const u8 *der_read(const u8 **p, const u8 *end, u8 tag, int len)
 {
-	if (keylen != 0x28)
+	const u8 *val = *p + 2;
+
+	if (end - *p < 2 || (*p)[0] != tag || (*p)[1] & 0x80 || (*p)[1] > end - val)
+		report("Volume key entry in keybag", "malformed blob.");
+	if (len >= 0 && (*p)[1] != len)
+		report("Volume key entry in keybag", "wrong size of blob field.");
+	*p = val + (*p)[1];
+	return val;
+}
+
+static void check_volume_key_entry(const char *uuid, const u8 *keydata, u16 keylen)
+{
+	const u8 *p = keydata, *end = keydata + keylen;
+	const u8 *body = NULL;
+
+	/* apfsck used to expect the bare wrapped key, so keep accepting it */
+	if (keylen == 0x28)
+		return;
+
+	/*
+	 * macOS wraps it in a DER blob, as apfs-fuse figured out: a version,
+	 * an HMAC and its salt, and then a nested sequence with another
+	 * version, the volume uuid, some flags and the wrapped key itself.
+	 */
+	if (keylen < 2)
 		report("Volume key entry in keybag", "wrong size.");
+	body = der_read(&p, end, 0x30, keylen - 2);
+	p = body;
+	der_read(&p, end, 0x80, -1);		/* Version */
+	der_read(&p, end, 0x81, 0x20);		/* HMAC */
+	der_read(&p, end, 0x82, 0x08);		/* Salt for the HMAC */
+	body = der_read(&p, end, 0xa3, -1);
+	if (p != end)
+		report("Volume key entry in keybag", "blob has trailing bytes.");
+
+	end = p;
+	p = body;
+	der_read(&p, end, 0x80, -1);		/* Version */
+	if (memcmp(der_read(&p, end, 0x81, 0x10), uuid, 0x10) != 0)
+		report("Volume key entry in keybag", "wrong volume uuid.");
+	der_read(&p, end, 0x82, 0x08);		/* Flags */
+	der_read(&p, end, 0x83, 0x28);		/* Wrapped key */
 }
 
 static void check_volume_unlock_records_entry(const u8 *keydata, u16 keylen)
@@ -62,7 +112,12 @@ static u16 check_keybag_entry(struct apfs_keybag_entry *entry, u16 remaining)
 	keylen = le16_to_cpu(entry->ke_keylen);
 	if (keylen > APFS_VOL_KEYBAG_ENTRY_MAX_SIZE - sizeof(*entry))
 		report("Keybag entry", "is too big.");
-	entry_len = keylen + sizeof(*entry);
+
+	/*
+	 * Entries are padded to 16 bytes. macOS doesn't zero the padding, it
+	 * may hold leftovers from other keys.
+	 */
+	entry_len = ROUND_UP(keylen + sizeof(*entry), 16);
 	if (entry_len > remaining)
 		report("Keybag entry", "too big for allocated bytes.");
 
@@ -72,7 +127,7 @@ static u16 check_keybag_entry(struct apfs_keybag_entry *entry, u16 remaining)
 
 	switch (le16_to_cpu(entry->ke_tag)) {
 	case KB_TAG_VOLUME_KEY:
-		check_volume_key_entry(keydata, keylen);
+		check_volume_key_entry(entry->ke_uuid, keydata, keylen);
 		break;
 	case KB_TAG_VOLUME_UNLOCK_RECORDS:
 		check_volume_unlock_records_entry(keydata, keylen);
@@ -120,8 +175,14 @@ static void check_keybag_locker(struct apfs_kb_locker *locker)
 
 	nkeys = le16_to_cpu(locker->kl_nkeys);
 	nbytes = le32_to_cpu(locker->kl_nbytes);
-	if (nbytes > sb->s_blocksize - sizeof(*locker))
+
+	/* The byte count includes the locker header */
+	if (nbytes < sizeof(*locker))
+		report("Keybag locker", "bad byte count.");
+	/* Leave room for the null entry at the end, it gets checked below */
+	if (nbytes > sb->s_blocksize - sizeof(struct apfs_obj_phys) - sizeof(*entry))
 		report("Keybag locker", "won't fit in block.");
+	nbytes -= sizeof(*locker);
 
 	entry = &locker->kl_entries[0];
 	for (i = 0; i < nkeys; ++i) {
@@ -132,11 +193,7 @@ static void check_keybag_locker(struct apfs_kb_locker *locker)
 		nbytes -= entry_len;
 	}
 
-	/*
-	 * So far I've always seen a leftover of 0x18 bytes here. I'm guessing
-	 * it's a terminating null entry.
-	 */
-	if (nbytes != sizeof(*entry))
+	if (nbytes != 0)
 		report("Keybag locker", "bad byte count.");
 	if (!keybag_entry_is_null(entry))
 		report("Keybag locker", "missing null termination.");
